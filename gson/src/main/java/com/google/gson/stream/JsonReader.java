@@ -22,6 +22,7 @@ import java.io.Closeable;
 import java.io.EOFException;
 import java.io.IOException;
 import java.io.Reader;
+import java.io.Writer;
 
 /**
  * Reads a JSON (<a href="http://www.ietf.org/rfc/rfc7159.txt">RFC 7159</a>)
@@ -829,6 +830,40 @@ public class JsonReader implements Closeable {
     return result;
   }
 
+
+  /**
+   * Writes the {@link com.google.gson.stream.JsonToken#STRING string} value of the next token in
+   * the provided {@link java.io.Writer}, consuming it. If the next token is a number, this method
+   * will write its string form.
+   *
+   * @throws IllegalStateException if the next token is not a string or if this reader is closed.
+   */
+  public void nextString(Writer writer) throws IOException {
+    int p = peeked;
+    if (p == PEEKED_NONE) {
+      p = doPeek();
+    }
+    if (p == PEEKED_UNQUOTED) {
+      nextUnquotedValue(writer);
+    } else if (p == PEEKED_SINGLE_QUOTED) {
+      nextQuotedValue('\'', writer);
+    } else if (p == PEEKED_DOUBLE_QUOTED) {
+      nextQuotedValue('"', writer);
+    } else if (p == PEEKED_BUFFERED) {
+      writer.write(peekedString);
+      peekedString = null;
+    } else if (p == PEEKED_LONG) {
+      writer.write(Long.toString(peekedLong));
+    } else if (p == PEEKED_NUMBER) {
+      writer.write(buffer, pos, peekedNumberLength);
+      pos += peekedNumberLength;
+    } else {
+      throw new IllegalStateException("Expected a string but was " + peek() + locationString());
+    }
+    peeked = PEEKED_NONE;
+    pathIndices[stackSize - 1]++;
+  }
+
   /**
    * Returns the {@link com.google.gson.stream.JsonToken#BOOLEAN boolean} value of the next token,
    * consuming it.
@@ -1034,6 +1069,51 @@ public class JsonReader implements Closeable {
   }
 
   /**
+   * Write, in the provided {@link java.io.Writer}, the string up to but not
+   * including {@code quote}, unescaping any character escape sequences encountered
+   * along the way. The opening quote should have already been read. This consumes
+   * the closing quote, but does not include it in writing.
+   *
+   * @param quote either ' or ".
+   * @throws NumberFormatException if any unicode escape sequences are malformed.
+   */
+  private void nextQuotedValue(char quote, Writer writer) throws IOException {
+    // Like nextNonWhitespace, this uses locals 'p' and 'l' to save inner-loop field access.
+    char[] buffer = this.buffer;
+    while (true) {
+      int p = pos;
+      int l = limit;
+      /* the index of the first character not yet written to the Writer. */
+      int start = p;
+      while (p < l) {
+        int c = buffer[p++];
+
+        if (c == quote) {
+          pos = p;
+          writer.write(buffer, start, p - start - 1);
+          return;
+        } else if (c == '\\') {
+          pos = p;
+          writer.write(buffer, start, p - start - 1);
+          writer.write(readEscapeCharacter());
+          p = pos;
+          l = limit;
+          start = p;
+        } else if (c == '\n') {
+          lineNumber++;
+          lineStart = p;
+        }
+      }
+
+      writer.write(buffer, start, p - start);
+      pos = p;
+      if (!fillBuffer(1)) {
+        throw syntaxError("Unterminated string");
+      }
+    }
+  }
+
+  /**
    * Returns an unquoted value as a string.
    */
   @SuppressWarnings("fallthrough")
@@ -1096,6 +1176,59 @@ public class JsonReader implements Closeable {
     }
     pos += i;
     return result;
+  }
+
+  /**
+   * Write in the provided {@link java.io.Writer} an unquoted value as a string.
+   */
+  private void nextUnquotedValue(Writer writer) throws IOException {
+    int i = 0;
+
+    findNonLiteralCharacter:
+    while (true) {
+      for (; pos + i < limit; i++) {
+        switch (buffer[pos + i]) {
+          case '/':
+          case '\\':
+          case ';':
+          case '#':
+          case '=':
+            checkLenient(); // fall-through
+          case '{':
+          case '}':
+          case '[':
+          case ']':
+          case ':':
+          case ',':
+          case ' ':
+          case '\t':
+          case '\f':
+          case '\r':
+          case '\n':
+            break findNonLiteralCharacter;
+        }
+      }
+
+      // Attempt to load the entire literal into the buffer at once.
+      if (i < buffer.length) {
+        if (fillBuffer(i + 1)) {
+          continue;
+        } else {
+          break;
+        }
+      }
+
+      // write in the Writer when the value is too long. This is too long to be a number!
+      writer.write(buffer, pos, i);
+      pos += i;
+      i = 0;
+      if (!fillBuffer(1)) {
+        break;
+      }
+    }
+
+    writer.write(buffer, pos, i);
+    pos += i;
   }
 
   private void skipQuotedValue(char quote) throws IOException {
@@ -1557,7 +1690,7 @@ public class JsonReader implements Closeable {
     case '\'':
     case '"':
     case '\\':
-    case '/':	
+    case '/':
     	return escaped;
     default:
     	// throw error when none of the above cases are matched
